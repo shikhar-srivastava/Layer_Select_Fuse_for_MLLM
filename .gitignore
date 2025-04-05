@@ -2,3 +2,4 @@
 *.egg-info
 playground/
 wandb/*
+checkpoint/*
