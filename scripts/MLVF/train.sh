@@ -1,5 +1,5 @@
 #!/bin/bash
-BASE_MODEL_NAME="test"
+BASE_MODEL_NAME="test_cka"
 
 # Define common variables
 FUSING_STRATEGY="I_D" # Options: E_D, E_M, I_D, I_M
@@ -14,9 +14,49 @@ VISION_TOWER="google/siglip-so400m-patch14-384" # google/siglip-so400m-patch14-3
 FINETUNE_DATA_PATH="./playground/data/LLaVA-Instruct-150K/llava_v1_5_mix665k.json" # ./playground/Cambrian-10M/jsons/cleaned_Cambrian737k.json
 FINETUNE_IMAGE_FOLDER="./playground/data" # ./playground/Cambrian-10M
 
+# Generate timestamp for wandb
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 
 # Pretraining
-#export TORCH_DISTRIBUTED_FIND_UNUSED_PARAMETERS=1
+# export TORCH_DISTRIBUTED_FIND_UNUSED_PARAMETERS=1
+accelerate launch llava/train/train.py \
+    --model_name_or_path ${MODEL_PATH} \
+    --version plain \
+    --data_path ${PRETRAIN_DATA_PATH} \
+    --image_folder ${PRETRAIN_IMAGE_FOLDER} \
+    --vision_tower ${VISION_TOWER} \
+    --mm_projector_type mlp2x_gelu \
+    --tune_mm_mlp_adapter True \
+    --mm_vision_select_layer -2 \
+    --layer_using_strategy ${USING_STRATEGY} \
+    --layer_fusing_strategy ${FUSING_STRATEGY} \
+    --mm_use_im_start_end False \
+    --mm_use_im_patch_token False \
+    --bf16 True \
+    --output_dir ./checkpoint/${BASE_MODEL_NAME}-${FUSING_STRATEGY}-pretrain-${USING_STRATEGY}-${MODEL_NAME} \
+    --num_train_epochs 1 \
+    --per_device_train_batch_size 1 \
+    --per_device_eval_batch_size 4 \
+    --gradient_accumulation_steps 8 \
+    --evaluation_strategy "no" \
+    --save_strategy "steps" \
+    --save_steps 500 \
+    --save_total_limit 4 \
+    --learning_rate 1e-3 \
+    --weight_decay 5e-2 \
+    --warmup_steps 200 \
+    --lr_scheduler_type "cosine" \
+    --logging_steps 1 \
+    --log_level warning \
+    --model_max_length 2048 \
+    --dataloader_num_workers 4 \
+    --lazy_preprocess True \
+    --report_to wandb \
+    --wandb_name ${BASE_MODEL_NAME}-${FUSING_STRATEGY}-pretrain-${USING_STRATEGY}-${MODEL_NAME}-${TIMESTAMP} \
+    --compute_cka True
+#--max_steps 10 \
+# # Fine-tuning
+# export TORCH_DISTRIBUTED_FIND_UNUSED_PARAMETERS=1
 # accelerate launch llava/train/train.py \
 #     --model_name_or_path ${MODEL_PATH} \
 #     --version plain \

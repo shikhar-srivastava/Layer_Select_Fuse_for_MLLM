@@ -159,29 +159,72 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         cka_similarities = None
         if compute_cka and outputs.hidden_states is not None and image_token_mask is not None:
             cka_similarities = {}
-            image_token_mask_bool = image_token_mask.bool()
-            if image_token_mask_bool.any(): 
-                image_input_embeds = inputs_embeds[image_token_mask_bool] # [bsz, n_image_patches, d_model]
-                image_input_embeds = image_input_embeds.view(-1, image_input_embeds.size(-1)) # [bsz * n_image_patches, d_model]
-                for layer_idx, layer_hidden_state in enumerate(outputs.hidden_states):
-                    layer_image_hidden_states = layer_hidden_state[image_token_mask_bool]
-                    layer_image_hidden_states = layer_image_hidden_states.view(-1, layer_image_hidden_states.size(-1))
-                    if image_input_embeds.shape[0] == layer_image_hidden_states.shape[0] and image_input_embeds.shape[0] > 1:
-                        try:
-                            cka_val = unbiased_cka(image_input_embeds, layer_image_hidden_states)
-                            cka_similarities[f'layer_{layer_idx}'] = cka_val.item()
-                        except Exception as e:
-                            print(f"Warning: CKA computation failed for layer {layer_idx}: {e}")
-                            cka_similarities[f'layer_{layer_idx}'] = None
-                    elif image_input_embeds.shape[0] <= 1:
-                        cka_similarities[f'layer_{layer_idx}'] = None
+            
+            for layer_idx, layer_hidden_state in enumerate(outputs.hidden_states):  # [batch, seq_len, hidden_dim]
+                layer_ckas = []
+                
+                # Loop over each sample in the batch
+                hl_bsz = layer_hidden_state.shape[0]
+                for sample_idx in range(hl_bsz):
+                    # Get text embeddings for this batch
+                    image_mask = image_token_mask[sample_idx].bool()
+                    text_mask = ~image_mask
+                    text_embeds = layer_hidden_state[sample_idx][text_mask]  # shape: [n_text_tokens, hidden_dim]
+                    
+                    # Extract embeddings
+                    text_embeds = layer_hidden_state[sample_idx][text_mask]    # [n_text_tokens, hidden_dim]
+                    image_embeds = layer_hidden_state[sample_idx][image_mask]  # [n_image_patches, hidden_dim]
+
+                    # Only compute CKA if we have both text and image embeddings
+                    if text_embeds.shape[0] > 0 and image_embeds.shape[0] > 0:
+                        # try:        
+                        # print(f"Text embeds shape: {text_embeds.shape}")
+                        # print(f"Image embeds shape: {image_embeds.shape}")
+                        # print(f"Text embeds dtype: {text_embeds.dtype}")
+                        # print(f"Image embeds dtype: {image_embeds.dtype}")
+                        cka_val = unbiased_cka(text_embeds, image_embeds)
+                        layer_ckas.append(cka_val.item())
+                        # except Exception as e:
+                        #     print(f"Warning: CKA computation failed for sample {sample_idx} in layer {layer_idx}: {e}")
+                        #     layer_ckas.append(None)
                     else:
-                        print(f"Warning: Shape mismatch for CKA in layer {layer_idx}. Input: {image_input_embeds.shape}, Layer: {layer_image_hidden_states.shape}. Skipping.")
-                        cka_similarities[f'layer_{layer_idx}'] = None
-            else:
-                num_layers = len(outputs.hidden_states) if outputs.hidden_states else 0
-                for layer_idx in range(num_layers):
-                     cka_similarities[f'layer_{layer_idx}'] = None
+                        layer_ckas.append(None)
+
+                # Aggregate layer CKA values per sample in batch via mean
+                # So this is: Per each layer, we have a list of CKA values for each sample in the batch.
+                # That means we compare each img_embed to text_embed for each sample in the batch --> Got CKA for that
+                valid_layer_ckas = [sample_ckas for sample_ckas in layer_ckas if sample_ckas is not None] # [bsz] -> Just ckas that were able to be computed
+                if valid_layer_ckas:
+                    layer_mean = sum(valid_layer_ckas) / len(valid_layer_ckas)
+                else:
+                    layer_mean = None
+            
+                        
+                cka_similarities[f'layer_{layer_idx}'] = layer_mean
+                if layer_mean is not None and torch.distributed.get_rank() == 0:
+                    wandb.log({
+                        f"cka/layer_{layer_idx}": layer_mean,
+                    })
+# # After collecting all layer CKAs, aggregate across ranks
+# if torch.distributed.is_initialized():
+#     # Gather CKA scores from all ranks
+#     gathered_ckas = [None] * torch.distributed.get_world_size()
+#     torch.distributed.all_gather_object(gathered_ckas, layer_ckas)
+    
+#     # Combine valid CKA scores (remove Nones)
+#     valid_ckas = [score for rank_ckas in gathered_ckas 
+#                  for score in rank_ckas if score is not None]
+    
+#     # Compute average CKA if we have valid scores
+#     if valid_ckas:
+#         avg_cka = sum(valid_ckas) / len(valid_ckas)
+        
+#         # Log only on rank 0
+#         if torch.distributed.get_rank() == 0:
+#             wandb.log({
+#                 f"cka/layer_{layer_idx}": avg_cka,
+#             })
+
 
         hidden_states = outputs[0]
         if self.config.pretraining_tp > 1:
