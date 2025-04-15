@@ -248,25 +248,6 @@ class KeywordsStoppingCriteria(StoppingCriteria):
             outputs.append(self.call_for_batch(output_ids[i].unsqueeze(0), scores))
         return all(outputs)
 
-# Function to compute the Hilbert-Schmidt Independence Criterion
-def hsic(K, L):
-    """
-    Computes the Hilbert-Schmidt Independence Criterion (HSIC).
-    Args:
-        K (torch.Tensor): First Gram matrix (n x n).
-        L (torch.Tensor): Second Gram matrix (n x n).
-    Returns:
-        torch.Tensor: The HSIC value.
-    """
-    n = K.shape[0]
-    H = torch.eye(n, device=K.device) - 1.0 / n * torch.ones(n, n, device=K.device)
-    K_c = torch.matmul(torch.matmul(H, K), H)
-    L_c = torch.matmul(torch.matmul(H, L), H)
-    # The Frobenius norm squared is equivalent to the trace of K_c.T @ L_c
-    # For symmetric matrices K_c, L_c, this is trace(K_c @ L_c)
-    criterion = torch.trace(torch.matmul(K_c, L_c))
-    return criterion / ((n - 1) ** 2) # Unbiased estimator factor
-
 def align_embeddings_for_cka(features_x: torch.Tensor, features_y: torch.Tensor, pooling: str = 'mean', projection_size: int = 64):
     """
     Aligns two feature matrices by applying pooling if their number of samples (rows) differ.
@@ -322,39 +303,72 @@ def align_embeddings_for_cka(features_x: torch.Tensor, features_y: torch.Tensor,
 # Function to compute the Centered Kernel Alignment (CKA) similarity (unbiased)
 def unbiased_cka(features_x, features_y, pooling: str = 'interpolate'):
     """
-    Computes the unbiased Centered Kernel Alignment (CKA) similarity between two feature matrices.
-    If the number of samples (rows) does not match, applies pooling (mean or max) to reduce each to a single vector.
+    Computes the unbiased Centered Kernel Alignment (CKA), matching B's approach
+    for unbiased centering. The old HSIC-based code is removed in favor of the
+    direct 'center-and-dot' formula.
 
     Args:
-        features_x (torch.Tensor): First feature matrix (n_samples_x, n_features).
-        features_y (torch.Tensor): Second feature matrix (n_samples_y, n_features).
-        pooling (str): Pooling strategy if n_samples mismatch. Options: 'mean' (default), 'max', 'none'.
-
+        features_x (torch.Tensor): First feature matrix.
+        features_y (torch.Tensor): Second feature matrix.
+        pooling (str): Pooling strategy if the sample counts differ.
     Returns:
-        torch.Tensor: The CKA similarity value.
+        torch.Tensor: The unbiased CKA similarity.
     """
-    # print("Features X shape before alignment:", features_x.shape)
-    # print("Features Y shape before alignment:", features_y.shape)
+    # Align the embeddings if needed
     features_x, features_y = align_embeddings_for_cka(features_x, features_y, pooling=pooling)
 
+    # Compute raw Gram matrices
+    gram_x = features_x @ features_x.t()
+    gram_y = features_y @ features_y.t()
 
+    # Center them with 'unbiased=True'
+    gram_x_centered = center_gram(gram_x, unbiased=True)
+    gram_y_centered = center_gram(gram_y, unbiased=True)
 
-    # Compute Gram matrices
-    gram_x = torch.matmul(features_x, features_x.t())
-    gram_y = torch.matmul(features_y, features_y.t())
+    # Compute scaled HSIC via elementwise product, then normalize by Frobenius norms
+    scaled_hsic = (gram_x_centered * gram_y_centered).sum()
+    norm_x = gram_x_centered.norm()
+    norm_y = gram_y_centered.norm()
 
-    # Compute HSIC
-    hsic_xy = hsic(gram_x, gram_y)
-    hsic_xx = hsic(gram_x, gram_x)
-    hsic_yy = hsic(gram_y, gram_y)
-
-    # CKA similarity
-    epsilon = 1e-5
-    cka_value = hsic_xy / (torch.sqrt(hsic_xx * hsic_yy + epsilon))
-    if torch.isnan(cka_value):
-        print("⚠️ Warning: CKA returned NaN")
-        print("HSIC XY:", hsic_xy.item())
-        print("HSIC XX:", hsic_xx.item())
-        print("HSIC YY:", hsic_yy.item())
-
+    # CKA ratio
+    cka_value = scaled_hsic / (norm_x * norm_y + 1e-12)
     return cka_value
+
+
+def center_gram(gram: torch.Tensor, unbiased: bool = True) -> torch.Tensor:
+    """
+    Centers a symmetric Gram matrix using the unbiased or biased approach
+    exactly as in B's reference implementation.
+
+    Args:
+        gram (torch.Tensor): Symmetric Gram matrix (n x n).
+        unbiased (bool): Whether to do unbiased centering (default True).
+
+    Returns:
+        torch.Tensor: Centered Gram matrix.
+    """
+    # (Optional) Check symmetry, as in B.
+    if not torch.allclose(gram, gram.t(), atol=1e-6):
+        raise ValueError("Input must be a symmetric matrix.")
+
+    gram = gram.clone()
+    n = gram.shape[0]
+
+    if unbiased:
+        # "Unbiased" approach from Szekely & Rizzo, also used by B
+        diag_indices = torch.arange(n, device=gram.device)
+        gram[diag_indices, diag_indices] = 0.0
+        means = gram.sum(dim=0, dtype=torch.float64) / (n - 2)
+        means = means - means.sum() / (2.0 * (n - 1))
+        gram = gram - means.unsqueeze(0)
+        gram = gram - means.unsqueeze(1)
+        # Fill diagonal with zeros again
+        gram[diag_indices, diag_indices] = 0.0
+    else:
+        # Standard "biased" centering
+        means = gram.mean(dim=0, dtype=torch.float64)
+        means = means - means.mean() / 2.0
+        gram = gram - means.unsqueeze(0)
+        gram = gram - means.unsqueeze(1)
+
+    return gram
